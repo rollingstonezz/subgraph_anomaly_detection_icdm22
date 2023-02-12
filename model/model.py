@@ -4,6 +4,8 @@ from torch.nn import Parameter
 import torch.nn.functional as F
 from torch_geometric.nn.inits import reset
 from typing import List, Optional, Set, Callable, get_type_hints
+from torch_geometric.utils import (negative_sampling, remove_self_loops,
+                                   add_self_loops)
 from torch_geometric.typing import Adj, Size
 from torch import Tensor
 

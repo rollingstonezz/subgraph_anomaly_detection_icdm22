@@ -14,6 +14,7 @@ from torch_geometric.utils import (negative_sampling, remove_self_loops,
 from torch_geometric.nn import MessagePassing
 from torch_geometric.nn.inits import reset
 from torch import Tensor
+import networkx as nx
 
 class ModularGNN(MessagePassing):
     def __init__(self, nn, aggr='add', **kwargs):

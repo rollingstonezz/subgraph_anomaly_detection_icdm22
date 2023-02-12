@@ -25,6 +25,7 @@ from torch_geometric.utils import (negative_sampling, remove_self_loops,
 from torch_geometric.nn import MessagePassing
 from torch_geometric.nn.inits import reset
 from sklearn.metrics import roc_auc_score, average_precision_score
+import itertools
 from model.encoder import *
 from model.decoder import *
 from model.model import *
@@ -61,11 +62,27 @@ def get_real_adj(data):
     return real_adj
 
 # load datasets
+def load_structure_synthetic(args):
+    n = args.size
+    n_anomaly = int(n*args.anomaly_ratio)
+
+    DATA_DIR = args.data_dir
+    dataset = args.dataset #'small_world', 'random', 'complete', 'scale_free'
+    anomaly_type = args.anomaly_type #'random', 'chain', 'complete'
+    size = args.size # 1000 2000 
+    FILE_NAME = os.path.join(DATA_DIR, 'structure_anomaly', dataset, anomaly_type, "size_{}.pkl".format(size))
+    with open(FILE_NAME, 'rb') as file:
+        data = pkl.load(file)
+
+    anomaly_flag = np.array([False]*(data.num_nodes-n_anomaly) + [True]*n_anomaly)
+    
+    return data, anomaly_flag
+
 def load_attribute_synthetic(args):
 
     DATA_DIR = args.data_dir
     FILE_NAME = "{}_{}_{}_{}.pkl".format(args.size, args.dim, args.anomaly_attr_ratio, args.diff_ratio)
-    FILE_PATH = os.path.join(DATA_DIR, FILE_NAME)
+    FILE_PATH = os.path.join(DATA_DIR, 'attribute_anomaly', FILE_NAME)
     
     with open(FILE_PATH, 'rb') as file:
         data = pkl.load(file)
@@ -133,6 +150,9 @@ if __name__ == '__main__':
     parser.add_argument('--learning_rate', type=float, default=5e-4)
     parser.add_argument('--beta_1', type=float, default=1.)
     parser.add_argument('--beta_2', type=float, default=1.)
+    parser.add_argument('--q', type=int, default=90)
+    parser.add_argument('--convergence', type=float, default=1e-4)
+    parser.add_argument('--ending_rounds', type=int, default=1)
     args = parser.parse_args()
 
     # load data
@@ -157,7 +177,7 @@ if __name__ == '__main__':
         data, anomaly_flag = load_real_world(args)
         RESULT_DIR = os.path.join(args.results_dir, str(args.real_world_name))
         RESULT_FILE_NAME = "{}_{}_{}.txt".format(args.real_world_name, args.embedding_channels, args.num_anchors)
-    
+
     # set results file dir
     if not os.path.exists(RESULT_DIR):
         os.makedirs(RESULT_DIR)
@@ -195,21 +215,40 @@ if __name__ == '__main__':
         decoder=innerproduct_decoder#mlp_decoder,
     )
     # move to GPU (if available)
-    device = torch.device('cuda:'+str(args.gpu) if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
     data = data.to(device)
     
     # inizialize the optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
-    
+    optimizer_sp = torch.optim.Adam(model.parameters(), lr=.1)
+
     x = data.x
     edge_index = data.edge_index
     y = real_adj.cpu().numpy()
     
-    for epoch in tqdm(range(1, args.epochs + 1)):
-        pos_loss, neg_loss, attr_loss = train(model, epoch, data)
-        loss = beta_1*(pos_loss + neg_loss) + beta_2*attr_loss.mean()
-        if epoch > args.warmup: # for training stability, add supermodular loss after warmup rounds
+    prev_loss = 1e12
+    flag = True
+    accumulated_rounds = 1
+    while flag:
+        print('Iteration #%2d'%(accumulated_rounds))
+        for epoch in range(1, args.epochs + 1):
+            pos_loss, neg_loss, attr_loss = train(model, epoch, data)
+            loss = beta_1*(pos_loss + neg_loss) + beta_2*attr_loss.mean()
+            loss.backward()
+            optimizer.step()
+            print('Epoch:%3d'%(epoch),'loss:%.4f'%(loss))
+
+
+        if np.abs(float(loss) - prev_loss) / float(loss) < args.convergence or accumulated_rounds >= args.ending_rounds:
+            flag = False
+        else:
+            prev_loss = float(loss)
+
+        for p in model.parameters():
+            p.requires_grad = False
+        model.r.requires_grad = True
+        for epoch in range(1, 20):
             with torch.no_grad():
                 z = model.encode(x, edge_index)
                 pred_adj_list = []
@@ -225,36 +264,39 @@ if __name__ == '__main__':
 
             pred_adj = torch.cat(pred_adj_list).view(-1,data.num_nodes).detach().cpu()
             pred = pred_adj.numpy()
-            
+
             # structure error
             mean_error_struct = np.abs((y-pred).mean(axis=1))
-            
+
             # attribute error
             _, pred_attr = model.decoder(z, data.edge_index)
             mean_error_feature = torch.square(pred_attr - x).mean(dim=1).detach().cpu().numpy()
-            
+
             # mixed error
             total_error = beta_1 * mean_error_struct + beta_2 * mean_error_feature
-            
+
             # add supmodular function
-            threshold = np.percentile(total_error, q=q)
+            threshold = np.percentile(total_error, q=args.q)
             smgnn = SuperModularModel(threshold=threshold)#ModularModel(threshold=threshold) 
             anomaly_scores, residal_data, anomaly_nodes_index = smgnn(data, total_error)
             # roc auc score
             continuous_predicted_value = torch.zeros(data.num_nodes)
             for i in range(residal_data.batch.max()+1):
                 continuous_predicted_value[anomaly_nodes_index[residal_data.batch == i]] = anomaly_scores.view(-1)[i]
-                
-            print(roc_auc_score(anomaly_flag, continuous_predicted_value.numpy()), file=f)
-            
+
+
             continuous_predicted_value = continuous_predicted_value.to(device)
             sp_loss = torch.maximum(
                         torch.zeros(continuous_predicted_value.size(0), device= residal_data.x.device), 
                         (model.r-continuous_predicted_value).view(-1)
                      ).sum() + model.r**2
-            loss += sp_loss
-                
-            
-        loss.backward()
-        optimizer.step()
-        
+            sp_loss.backward()
+            optimizer_sp.step()
+            #print('model.r',model.r)
+
+        for p in model.parameters():
+            p.requires_grad = True
+        print('roc_auc_score:%.3f'%(roc_auc_score(anomaly_flag, continuous_predicted_value.cpu().numpy())))
+
+
+
